@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Cyber-Holo Interface v4.0 - Kinetic Spin</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Courier New', monospace; }
+        
+        /* --- HUD Layer --- */
+        #hud {
+            position: absolute; width: 100%; height: 100%; pointer-events: none;
+            display: flex; flex-direction: column; justify-content: space-between;
+            z-index: 10;
+        }
+
+        .header {
+            padding: 20px; text-align: left; color: #00ffcc;
+            text-shadow: 0 0 10px rgba(0,255,204,0.5);
+            background: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);
+        }
+        h1 { margin: 0; font-size: 24px; letter-spacing: 4px; text-transform: uppercase; }
+        .sub { font-size: 12px; opacity: 0.7; }
+
+        .dock {
+            display: flex; justify-content: center; gap: 15px; padding-bottom: 30px;
+            background: linear-gradient(to top, rgba(0,0,0,0.9), transparent);
+            pointer-events: auto;
+        }
+
+        .holo-btn {
+            position: relative; width: 100px; height: 60px;
+            background: rgba(0, 20, 40, 0.6);
+            border: 1px solid rgba(0, 255, 204, 0.3);
+            border-radius: 8px; color: #00ffcc;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: bold; font-size: 14px; cursor: pointer;
+            overflow: hidden; transition: all 0.3s; pointer-events: auto;
+            text-shadow: 0 0 5px #00ffcc;
+        }
+
+        .btn-fill {
+            position: absolute; bottom: 0; left: 0; height: 100%; width: 0%;
+            background: rgba(0, 255, 204, 0.4);
+            transition: width 0.1s linear; z-index: 0;
+        }
+        .btn-text { z-index: 1; position: relative; }
+
+        .holo-btn.active {
+            border-color: #fff; background: rgba(0, 255, 204, 0.2);
+            box-shadow: 0 0 15px #00ffcc;
+        }
+
+        #cursor {
+            position: absolute; top: 0; left: 0;
+            width: 30px; height: 30px;
+            border: 2px solid #fff; border-radius: 50%;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 10px #fff;
+            pointer-events: none; z-index: 999;
+            transition: width 0.2s, height 0.2s;
+            mix-blend-mode: difference;
+        }
+        #cursor.hovering { width: 50px; height: 50px; background: rgba(255,255,255,0.2); }
+
+        #video-hidden { display: none; }
+    </style>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="cursor"></div>
+
+    <div id="hud">
+        <div class="header">
+            <h1>KINETIC HOLO v4.0</h1>
+            <div class="sub">CONTROL: SWIPE TO SPIN // HOVER TO SELECT</div>
+        </div>
+
+        <div class="dock">
+            <div class="holo-btn" data-shape="dna"><div class="btn-fill"></div><span class="btn-text">DNA</span></div>
+            <div class="holo-btn" data-shape="heart"><div class="btn-fill"></div><span class="btn-text">HEART</span></div>
+            <div class="holo-btn" data-shape="torus"><div class="btn-fill"></div><span class="btn-text">TORUS</span></div>
+            <div class="holo-btn" data-shape="atomic"><div class="btn-fill"></div><span class="btn-text">ATOM</span></div>
+            <div class="holo-btn" data-shape="galaxy"><div class="btn-fill"></div><span class="btn-text">GALAXY</span></div>
+            <div class="holo-btn" data-shape="reset"><div class="btn-fill"></div><span class="btn-text">RESET</span></div>
+        </div>
+    </div>
+
+    <video id="video-hidden"></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+        // --- Config ---
+        const PARTICLE_COUNT = 30000;
+        const HOVER_TRIGGER_TIME = 1000; 
+        const FRICTION = 0.95; // How fast spin slows down (0.9 to 0.99)
+        const VELOCITY_MULTIPLIER = 0.5; // Sensitivity of swipe
+
+        // --- State ---
+        const state = {
+            currentShape: 'sphere',
+            expansion: 1.0,
+            hoverTarget: null,
+            hoverStartTime: 0,
+            glitchIntensity: 0,
+            
+            // Physics for Rotation
+            rotationVelocity: 0.002, // Initial slow spin
+            lastHandX: 0.5,
+            isHandPresent: false
+        };
+
+        let scene, camera, renderer, composer, glitchPass;
+        let geometry, points, positions, targetPositions, colors;
+        let clock = new THREE.Clock();
+
+        // --- Glitch Shader ---
+        const GlitchShader = {
+            uniforms: { "tDiffuse": { value: null }, "amount": { value: 0.0 }, "time": { value: 0.0 } },
+            vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+            fragmentShader: `
+                uniform sampler2D tDiffuse; uniform float amount; uniform float time; varying vec2 vUv;
+                float rand(vec2 co){ return fract(sin(dot(co.xy ,vec2(12.9898,78.233))) * 43758.5453); }
+                void main() {
+                    vec2 p = vUv;
+                    float shift = amount * 0.02;
+                    float r = texture2D(tDiffuse, p + vec2(shift, 0.0)).r;
+                    float g = texture2D(tDiffuse, p).g;
+                    float b = texture2D(tDiffuse, p - vec2(shift, 0.0)).b;
+                    float noise = rand(vec2(time, p.y));
+                    if(noise < amount * 0.5) { r+=0.1; g+=0.1; b+=0.1; }
+                    gl_FragColor = vec4(r, g, b, 1.0);
+                }
+            `
+        };
+
+        initThree();
+        initMediaPipe();
+        animate();
+
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000510, 0.02);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 40;
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            // Post Processing
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0.1; bloomPass.strength = 1.2; bloomPass.radius = 0.5;
+            glitchPass = new ShaderPass(GlitchShader);
+            
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+            composer.addPass(glitchPass);
+
+            // Particles
+            geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(PARTICLE_COUNT * 3);
+            targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+            colors = new Float32Array(PARTICLE_COUNT * 3);
+            const baseColor = new THREE.Color(0x00ffcc);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                positions[i*3] = (Math.random()-0.5)*100; positions[i*3+1] = (Math.random()-0.5)*100; positions[i*3+2] = (Math.random()-0.5)*100;
+                targetPositions[i*3] = positions[i*3]; targetPositions[i*3+1] = positions[i*3+1]; targetPositions[i*3+2] = positions[i*3+2];
+                colors[i*3] = baseColor.r; colors[i*3+1] = baseColor.g; colors[i*3+2] = baseColor.b;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const material = new THREE.PointsMaterial({ size: 0.15, vertexColors: true, blending: THREE.AdditiveBlending, transparent: true, opacity: 0.8, depthWrite: false });
+            points = new THREE.Points(geometry, material);
+            scene.add(points);
+
+            updateShape('reset');
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                composer.setSize(window.innerWidth, window.innerHeight);
+            });
+        }
+
+        function updateShape(type) {
+            state.currentShape = type;
+            state.glitchIntensity = 1.0; 
+            const p = targetPositions;
+            const c = geometry.attributes.color.array;
+            let col = new THREE.Color();
+
+            if(type=='dna') col.setHex(0x00ff88);
+            else if(type=='heart') col.setHex(0xff0044);
+            else if(type=='torus') col.setHex(0xffff00);
+            else if(type=='atomic') col.setHex(0x00aaff);
+            else if(type=='galaxy') col.setHex(0xaa00ff);
+            else col.setHex(0xcccccc);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const idx = i*3; let x,y,z;
+                if(type === 'dna') {
+                    const t = (i/PARTICLE_COUNT)*Math.PI*20; x = Math.cos(t)*6; z = Math.sin(t)*6; y = (i/PARTICLE_COUNT)*60-30;
+                    if(i%2==0) { x=Math.cos(t+Math.PI)*6; z=Math.sin(t+Math.PI)*6; } x+=(Math.random()-0.5); z+=(Math.random()-0.5);
+                } else if(type === 'heart') {
+                    const t = Math.random()*Math.PI*2; x = 16*Math.pow(Math.sin(t),3); y = 13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t); z = (Math.random()-0.5)*5; x*=0.8; y*=0.8; z*=0.8;
+                } else if(type === 'torus') {
+                    const u = (i/PARTICLE_COUNT)*Math.PI*20; const r = Math.cos(3*u)+2; x = r*Math.cos(2*u)*8; y = r*Math.sin(2*u)*8; z = -Math.sin(3*u)*8;
+                } else if(type === 'atomic') {
+                    if(i<PARTICLE_COUNT*0.3){ const r=Math.random()*4; const th=Math.random()*6.28; const ph=Math.acos(2*Math.random()-1); x=r*Math.sin(ph)*Math.cos(th); y=r*Math.sin(ph)*Math.sin(th); z=r*Math.cos(ph); }
+                    else { const sh = i%3; const ang=Math.random()*6.28; const rad=14; if(sh==0){x=rad*Math.cos(ang); y=rad*Math.sin(ang); z=(Math.random()-0.5);} if(sh==1){x=rad*Math.cos(ang); z=rad*Math.sin(ang); y=(Math.random()-0.5);} if(sh==2){y=rad*Math.cos(ang); z=rad*Math.sin(ang); x=(Math.random()-0.5);} }
+                } else if(type === 'galaxy') {
+                    const ang = (i/PARTICLE_COUNT)*Math.PI*10; const rad=(i/PARTICLE_COUNT)*30; x = Math.cos(ang)*rad; z = Math.sin(ang)*rad; y=(Math.random()-0.5)*2; x+=(Math.random()-0.5); z+=(Math.random()-0.5);
+                } else {
+                    const r = 20 + Math.random()*10; const th=Math.random()*6.28; const ph=Math.acos(2*Math.random()-1); x=r*Math.sin(ph)*Math.cos(th); y=r*Math.sin(ph)*Math.sin(th); z=r*Math.cos(ph);
+                }
+                p[idx] = x; p[idx+1] = y; p[idx+2] = z;
+                c[idx] = col.r; c[idx+1] = col.g; c[idx+2] = col.b;
+            }
+            geometry.attributes.color.needsUpdate = true;
+        }
+
+        // --- Interaction Logic ---
+        function initMediaPipe() {
+            const video = document.getElementById('video-hidden');
+            const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6 });
+            hands.onResults(onResults);
+            new Camera(video, { onFrame: async () => { await hands.send({image: video}); }, width: 640, height: 480 }).start();
+        }
+
+        function onResults(results) {
+            const cursor = document.getElementById('cursor');
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                const index = lm[8]; // Index Tip
+                
+                // 1. Coordinates
+                const xRaw = 1 - index.x; // Mirror X
+                const xPx = xRaw * window.innerWidth;
+                const yPx = index.y * window.innerHeight;
+
+                // 2. Cursor Smoothing
+                const curX = parseFloat(cursor.style.left || xPx);
+                const curY = parseFloat(cursor.style.top || yPx);
+                cursor.style.left = `${curX + (xPx - curX)*0.2}px`;
+                cursor.style.top = `${curY + (yPx - curY)*0.2}px`;
+
+                // 3. --- NEW: KINETIC ROTATION LOGIC ---
+                // Calculate Delta (How much hand moved this frame)
+                if (state.isHandPresent) {
+                    const deltaX = xRaw - state.lastHandX; 
+                    // Add velocity to rotation (delta * sensitivity)
+                    state.rotationVelocity += deltaX * VELOCITY_MULTIPLIER;
+                    
+                    // Cap max speed so it doesn't go crazy
+                    state.rotationVelocity = THREE.MathUtils.clamp(state.rotationVelocity, -0.2, 0.2);
+                }
+                
+                state.lastHandX = xRaw;
+                state.isHandPresent = true;
+
+                // 4. Pinch Zoom
+                const dist = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
+                const targetExp = THREE.MathUtils.mapLinear(dist, 0.03, 0.15, 0.5, 2.0);
+                state.expansion = THREE.MathUtils.lerp(state.expansion, targetExp, 0.1);
+
+                checkHoverCollisions(xPx, yPx);
+            } else {
+                state.isHandPresent = false;
+            }
+        }
+
+        // --- UI Collision ---
+        function checkHoverCollisions(x, y) {
+            const cursor = document.getElementById('cursor');
+            const elem = document.elementFromPoint(x, y);
+            const btn = elem ? elem.closest('.holo-btn') : null;
+
+            if (btn) {
+                cursor.classList.add('hovering');
+                if (state.hoverTarget !== btn) {
+                    state.hoverTarget = btn;
+                    state.hoverStartTime = Date.now();
+                    resetAllButtons();
+                } else {
+                    const elapsed = Date.now() - state.hoverStartTime;
+                    const progress = Math.min(elapsed / HOVER_TRIGGER_TIME, 1);
+                    const bar = btn.querySelector('.btn-fill');
+                    if(bar) bar.style.width = `${progress * 100}%`;
+                    if (progress >= 1 && !btn.classList.contains('active')) activateButton(btn);
+                }
+            } else {
+                cursor.classList.remove('hovering');
+                state.hoverTarget = null;
+                resetAllButtons();
+            }
+        }
+
+        function resetAllButtons() { document.querySelectorAll('.btn-fill').forEach(el => el.style.width = '0%'); }
+        function activateButton(btn) {
+            document.querySelectorAll('.holo-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            const shape = btn.getAttribute('data-shape');
+            if (shape && shape !== state.currentShape) updateShape(shape);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Glitch Decay
+            if (state.glitchIntensity > 0) state.glitchIntensity = Math.max(0, state.glitchIntensity - 0.05);
+            glitchPass.uniforms.amount.value = state.glitchIntensity;
+            glitchPass.uniforms.time.value = clock.getElapsedTime();
+
+            // --- KINETIC PHYSICS ENGINE ---
+            // 1. Apply velocity to rotation
+            points.rotation.y += state.rotationVelocity;
+
+            // 2. Apply Friction (Damping)
+            // If hand is NOT moving fast or absent, slow down velocity gradually
+            state.rotationVelocity *= FRICTION;
+
+            // 3. Keep a tiny minimum spin for life (optional)
+            if (Math.abs(state.rotationVelocity) < 0.002) {
+                state.rotationVelocity = 0.002 * Math.sign(state.rotationVelocity || 1);
+            }
+
+            // Particle Physics
+            const pArr = geometry.attributes.position.array;
+            for (let i = 0; i < PARTICLE_COUNT * 3; i++) {
+                let target = targetPositions[i] * state.expansion;
+                if(state.glitchIntensity > 0.1) target += (Math.random()-0.5) * state.glitchIntensity * 5;
+                pArr[i] += (target - pArr[i]) * 0.08;
+            }
+            geometry.attributes.position.needsUpdate = true;
+            composer.render();
+        }
+    </script>
+</body>
+</html>
